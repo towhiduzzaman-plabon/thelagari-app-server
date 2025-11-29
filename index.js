@@ -10,7 +10,9 @@ const crypto = require("crypto");
 
 const admin = require("firebase-admin");
 
-const serviceAccount = require("./thelagari-app-firebase-adminsdk.json");
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
@@ -51,6 +53,7 @@ const verifyFBToken = async (req, res, next) => {
 }
 
 
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.gpu0gw6.mongodb.net/?appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -84,6 +87,17 @@ async function run() {
             const user = await userCollection.findOne(query);
 
             if (!user || user.role !== 'admin') {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
+
+            next();
+        }
+        const verifyRider = async (req, res, next) => {
+            const email = req.decoded_email;
+            const query = { email };
+            const user = await userCollection.findOne(query);
+
+            if (!user || user.role !== 'rider') {
                 return res.status(403).send({ message: 'forbidden access' });
             }
 
@@ -208,6 +222,26 @@ async function run() {
             res.send(result);
         })
 
+        app.get('/parcels/delivery-status/stats', async (req, res) => {
+            const pipeline = [
+                {
+                    $group: {
+                        _id: '$deliveryStatus',
+                        count: { $sum: 1 }
+                    }
+                },
+                {
+                    $project: {
+                        status: '$_id',
+                        count: 1,
+                        // _id: 0
+                    }
+                }
+            ]
+            const result = await parcelsCollection.aggregate(pipeline).toArray();
+            res.send(result);
+        })
+
         app.post('/parcels', async (req, res) => {
             const parcel = req.body;
             const trackingId = generateTrackingId();
@@ -293,8 +327,8 @@ async function run() {
 
         // payment related apis
         app.post('/payment-checkout-session', async (req, res) => {
-            const paymentInfo = req.body;
-            const amount = parseInt(paymentInfo.cost) * 100;
+            const parcelInfo = req.body;
+            const amount = parseInt(parcelInfo.cost) * 100;
             const session = await stripe.checkout.sessions.create({
                 line_items: [
                     {
@@ -302,7 +336,7 @@ async function run() {
                             currency: 'usd',
                             unit_amount: amount,
                             product_data: {
-                                name: `Please pay for: ${paymentInfo.parcelName}`
+                                name: `Please pay for: ${parcelInfo.parcelName}`
                             }
                         },
                         quantity: 1,
@@ -310,10 +344,10 @@ async function run() {
                 ],
                 mode: 'payment',
                 metadata: {
-                    parcelId: paymentInfo.parcelId,
-                    trackingId: paymentInfo.trackingId
+                    parcelId: parcelInfo.parcelId,
+                    trackingId: parcelInfo.trackingId
                 },
-                customer_email: paymentInfo.senderEmail,
+                customer_email: parcelInfo.senderEmail,
                 success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
                 cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
             })
@@ -363,9 +397,8 @@ async function run() {
             const query = { transactionId: transactionId }
 
             const paymentExist = await paymentCollection.findOne(query);
-            console.log(paymentExist);
+            // console.log(paymentExist);
             if (paymentExist) {
-
                 return res.send({
                     message: 'already exists',
                     transactionId,
@@ -400,23 +433,20 @@ async function run() {
                     trackingId: trackingId
                 }
 
-                if (session.payment_status === 'paid') {
-                    const resultPayment = await paymentCollection.insertOne(payment);
 
-                    logTracking(trackingId, 'parcel_paid')
+                const resultPayment = await paymentCollection.insertOne(payment);
 
-                    res.send({
-                        success: true,
-                        modifyParcel: result,
-                        trackingId: trackingId,
-                        transactionId: session.payment_intent,
-                        paymentInfo: resultPayment
-                    })
-                }
+                logTracking(trackingId, 'parcel_paid')
 
+                return res.send({
+                    success: true,
+                    modifyParcel: result,
+                    trackingId: trackingId,
+                    transactionId: session.payment_intent,
+                    paymentInfo: resultPayment
+                })
             }
-
-            res.send({ success: false })
+            return res.send({ success: false })
         })
 
         // payment related apis
@@ -456,6 +486,56 @@ async function run() {
 
             const cursor = ridersCollection.find(query)
             const result = await cursor.toArray();
+            res.send(result);
+        })
+
+        app.get('/riders/delivery-per-day', async (req, res) => {
+            const email = req.query.email;
+            // aggregate on parcel
+            const pipeline = [
+                {
+                    $match: {
+                        riderEmail: email,
+                        deliveryStatus: "parcel_delivered"
+                    }
+                },
+                {
+                    $lookup: {
+                        from: "trackings",
+                        localField: "trackingId",
+                        foreignField: "trackingId",
+                        as: "parcel_trackings"
+                    }
+                },
+                {
+                    $unwind: "$parcel_trackings"
+                },
+                {
+                    $match: {
+                        "parcel_trackings.status": "parcel_delivered"
+                    }
+                },
+                {
+                    // convert timestamp to YYYY-MM-DD string
+                    $addFields: {
+                        deliveryDay: {
+                            $dateToString: {
+                                format: "%Y-%m-%d",
+                                date: "$parcel_trackings.createdAt"
+                            }
+                        }
+                    }
+                },
+                {
+                    // group by date
+                    $group: {
+                        _id: "$deliveryDay",
+                        deliveredCount: { $sum: 1 }
+                    }
+                }
+            ];
+
+            const result = await parcelsCollection.aggregate(pipeline).toArray();
             res.send(result);
         })
 
@@ -504,8 +584,8 @@ async function run() {
         })
 
         // Send a ping to confirm a successful connection
-        await client.db("admin").command({ ping: 1 });
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
+        // await client.db("admin").command({ ping: 1 });
+        // console.log("Pinged your deployment. You successfully connected to MongoDB!");
     } finally {
         // Ensures that the client will close when you finish/error
         // await client.close();

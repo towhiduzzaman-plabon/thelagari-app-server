@@ -1,3 +1,4 @@
 node_modules
 .env
 thelagari-app-firebase-adminsdk.json
+.vercel
